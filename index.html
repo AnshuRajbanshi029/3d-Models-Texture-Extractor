@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Model Animation Editor</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Inter', sans-serif;
+            background-color: #1a1a1a;
+            color: white;
+        }
+
+        #container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #drop-zone {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 40px;
+            border: 2px dashed #666;
+            border-radius: 10px;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.8);
+            transition: opacity 0.3s;
+        }
+
+        #drop-zone.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            border-radius: 5px;
+            pointer-events: auto;
+            /* Enable interaction */
+        }
+
+        button:hover {
+            background: #666;
+        }
+
+        #drop-zone h1 {
+            margin: 0 0 10px 0;
+            font-size: 24px;
+        }
+
+        #drop-zone p {
+            color: #888;
+            margin: 0;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 20px;
+            display: none;
+        }
+
+        /* GUI Position Override */
+        .lil-gui {
+            top: 10px !important;
+            right: 10px !important;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="container"></div>
+
+    <div id="drop-zone">
+        <h1>Model Editor</h1>
+        <p>Drag & Drop .GLB file here</p>
+        <p>OR</p>
+        <button id="btn-select">Select File</button>
+        <input type="file" id="file-input" accept=".glb,.gltf" style="display:none">
+
+        <!-- Combo Button (Static) -->
+        <button id="btn-combo"
+            style="display:block; width:100%; margin-top:20px; background-color:#4CAF50; color:white; padding:10px; border:none; cursor:pointer;">
+            Load Punch Combo Project
+        </button>
+    </div>
+
+    <div id="loading">Loading...</div>
+
+    <!-- Import Map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // --- GLOBAL VARIABLES ---
+        let scene, camera, renderer, mixer, clock;
+        let currentModel, currentAnimations = [];
+        let activeAction;
+        let gui;
+
+        // Settings State
+        const settings = {
+            playbackSpeed: 1.0,
+            trimStart: 0,
+            trimEnd: 100,
+            loop: true,
+            play: true,
+            wireframe: false,
+            exportName: 'modified_model',
+            export: exportGLB
+        };
+
+        const container = document.getElementById('container');
+        const dropZone = document.getElementById('drop-zone');
+        const loading = document.getElementById('loading');
+
+        init();
+        animate();
+
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222);
+            scene.fog = new THREE.Fog(0x222222, 10, 50);
+
+            // Grid
+            const grid = new THREE.GridHelper(20, 20, 0x444444, 0x333333);
+            scene.add(grid);
+
+            // Lights
+            const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 3);
+            hemiLight.position.set(0, 20, 0);
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 3);
+            dirLight.position.set(3, 10, 10);
+            dirLight.castShadow = true;
+            scene.add(dirLight);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 1.5, 3);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            renderer.shadowMap.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            // Controls
+            const controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 1, 0);
+            controls.update();
+
+            clock = new THREE.Clock();
+
+            // Drag & Drop Handling - attach to dropZone AND document for full coverage
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dropZone.style.borderColor = '#0af';
+            });
+            dropZone.addEventListener('dragleave', (e) => {
+                e.preventDefault();
+                dropZone.style.borderColor = '#666';
+            });
+            dropZone.addEventListener('drop', handleDrop);
+
+            // Also listen on document for when overlay is hidden
+            document.addEventListener('dragover', (e) => e.preventDefault());
+            document.addEventListener('drop', handleDrop);
+
+            window.addEventListener('resize', onWindowResize, false);
+
+            setupInput();
+            initGUI();
+        }
+
+        function initGUI() {
+            gui = new GUI({ title: 'Animation Controls' });
+
+            gui.add(settings, 'playbackSpeed', 0.1, 2.0).name('Speed (x)').onChange(updateSpeed);
+
+            const folderTrim = gui.addFolder('Trimming (Frames)');
+            // We'll add dynamic controls here when animation loads
+
+            gui.add(settings, 'play').name('Play/Pause').onChange(togglePlay);
+
+            const folderExport = gui.addFolder('Export');
+            folderExport.add(settings, 'exportName').name('Filename');
+            folderExport.add(settings, 'export').name('Download .GLB');
+        }
+
+        // --- SEQUENCER STATE ---
+        const sequencer = {
+            active: false,
+            clips: {}, // start, left, right
+            actions: {},
+            params: {
+                // Default Method 3 Values
+                startTrimStart: 0, startTrimEnd: 75,
+
+                leftTrimStart: 10, leftTrimEnd: 50,
+                leftOverlap: 5,
+
+                rightTrimStart: 10, rightTrimEnd: 50,
+                rightOverlap: 5,
+
+                speed: 1.0
+            }
+        };
+
+        function setupInput() {
+            console.log("Running setupInput");
+            const btn = document.getElementById('btn-select');
+            const input = document.getElementById('file-input');
+            const btnCombo = document.getElementById('btn-combo'); // Get Static Button
+
+            if (btnCombo) {
+                btnCombo.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    console.log("Combo Button Clicked");
+                    alert("Starting Load..."); // DEBUG ALERT
+                    loadPunchComboProject();
+                });
+            }
+
+            // Button Click
+            btn.addEventListener('click', () => {
+                input.click();
+            });
+
+            // File Select
+            input.addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                loadFile(file);
+            });
+        }
+
+        async function loadPunchComboProject() {
+            try {
+                dropZone.classList.add('hidden');
+                loading.style.display = 'block';
+                loading.innerText = "Loading 3 Models...";
+
+                // 1. Load Base (PunchStart) with Mesh
+                const glbStart = await loadGLBBytes('../3D Models/Punching_start.glb');
+                const glbLeft = await loadGLBBytes('../3D Models/left_punching.glb');
+                const glbRight = await loadGLBBytes('../3D Models/right_punching.glb');
+
+
+                // 2. Setup Scene with Base
+                setupSceneFromGLB(glbStart);
+
+                // 3. Extract & Normalize Clips
+                const clipStart = THREE.AnimationClip.findByName(glbStart.animations, glbStart.animations[0].name); // Usually mixed name
+                const clipLeft = THREE.AnimationClip.findByName(glbLeft.animations, glbLeft.animations[0].name);
+                const clipRight = THREE.AnimationClip.findByName(glbRight.animations, glbRight.animations[0].name);
+
+                normalizeClip(clipStart);
+                normalizeClip(clipLeft);
+                normalizeClip(clipRight);
+
+                clipStart.name = "PunchStart";
+                clipLeft.name = "LeftPunch";
+                clipRight.name = "RightPunch";
+
+                sequencer.clips = { start: clipStart, left: clipLeft, right: clipRight };
+                sequencer.active = true;
+
+                // 4. GUI for Sequencer
+                setupSequencerGUI();
+
+                // 5. Start Loop
+                playSequencerLoop();
+
+                loading.style.display = 'none';
+
+            } catch (err) {
+                console.error(err);
+                alert("Failed to load: " + err.message);
+                loading.style.display = 'none';
+                dropZone.classList.remove('hidden');
+            }
+        }
+
+        function loadGLBBytes(url) {
+            return new Promise((resolve, reject) => {
+                new GLTFLoader().load(url, resolve, undefined, reject);
+            });
+        }
+
+        function setupSceneFromGLB(gltf) {
+            if (currentModel) scene.remove(currentModel);
+            if (mixer) mixer.stopAllAction();
+
+            currentModel = gltf.scene;
+            scene.add(currentModel);
+
+            // Shadows
+            currentModel.traverse(node => { if (node.isMesh) { node.castShadow = true; node.receiveShadow = true; } });
+
+            mixer = new THREE.AnimationMixer(currentModel);
+        }
+
+        function normalizeClip(clip) {
+            // Remove Hips X/Z Position (Root Motion)
+            // Three.js tracks: "mixamorigHips.position"
+            // We need to filter the values in the track?
+            // Actually, deleting the track entirely is safest for "In-Place" logic
+            // providing the hips don't need generic up/down movement (they do).
+            // So we must ONLY remove X and Z motion.
+
+            clip.tracks.forEach(track => {
+                if (track.name.includes('Hips') && track.name.includes('position')) {
+                    // It's a VectorKeyframeTrack. values = [x, y, z, x, y, z...]
+                    // We want to ZERO out X and Z (indices 0, 2, 3, 5, etc.)
+                    // Usually Y is UP in Three.js? 
+                    // Let's verify: In Mixamo/Blender Z is up. In GLTF export to Three.js it might rotate.
+                    // Usually Hips.position Y is height.
+                    // We will zero X and Z.
+                    for (let i = 0; i < track.values.length; i += 3) {
+                        track.values[i] = 0; // X
+                        // track.values[i+1] = track.values[i+1]; // Y (Height) - KEEP
+                        track.values[i + 2] = 0; // Z
+                    }
+                }
+            });
+        }
+
+        function setupSequencerGUI() {
+            gui.destroy();
+            gui = new GUI({ title: 'Combo Sequencer' });
+
+            const p = sequencer.params;
+
+            gui.add(p, 'speed', 0.1, 2.0).name('Global Speed');
+
+            const f1 = gui.addFolder('1. Punch Start');
+            f1.add(p, 'startTrimStart', 0, 100).name('Trim Start');
+            f1.add(p, 'startTrimEnd', 0, 150).name('Trim End');
+
+            const f2 = gui.addFolder('2. Left Punch');
+            f2.add(p, 'leftTrimStart', 0, 100).name('Trim Start');
+            f2.add(p, 'leftTrimEnd', 0, 100).name('Trim End');
+            f2.add(p, 'leftOverlap', 0, 20).name('Overlap (Frames)');
+
+            const f3 = gui.addFolder('3. Right Punch');
+            f3.add(p, 'rightTrimStart', 0, 100).name('Trim Start');
+            f3.add(p, 'rightTrimEnd', 0, 100).name('Trim End');
+            f3.add(p, 'rightOverlap', 0, 20).name('Overlap (Frames)');
+
+            gui.add({ restart: playSequencerLoop }, 'restart').name('Restart Loop');
+        }
+
+        function playSequencerLoop() {
+            if (sequencer.loopTimer) clearTimeout(sequencer.loopTimer);
+            mixer.stopAllAction();
+
+            const p = sequencer.params;
+            const fps = 30;
+
+            // 1. Play Start
+            const ref1 = mixer.clipAction(sequencer.clips.start);
+            const action1 = configureAction(ref1, p.startTrimStart, p.startTrimEnd, p.speed);
+            action1.play();
+
+            // Calculate durations in Seconds
+            const dur1 = (p.startTrimEnd - p.startTrimStart) / fps / p.speed;
+            const overlap1 = p.leftOverlap / fps / p.speed;
+
+            // 2. Schedule Left
+            const ref2 = mixer.clipAction(sequencer.clips.left);
+            const action2 = configureAction(ref2, p.leftTrimStart, p.leftTrimEnd, p.speed);
+            action2.startAt(dur1 - overlap1);
+            action2.play();
+
+            // Calculate Left Duration
+            const dur2 = (p.leftTrimEnd - p.leftTrimStart) / fps / p.speed;
+            const overlap2 = p.rightOverlap / fps / p.speed;
+
+            // 3. Schedule Right
+            const ref3 = mixer.clipAction(sequencer.clips.right);
+            const action3 = configureAction(ref3, p.rightTrimStart, p.rightTrimEnd, p.speed);
+            // Start at: StartTime + LeftDuration - Overlap2
+            // StartTime of Left = (dur1 - overlap1)
+            const start3 = (dur1 - overlap1) + dur2 - overlap2;
+            action3.startAt(start3);
+            action3.play();
+
+            // 4. Loop (Reset)
+            const dur3 = (p.rightTrimEnd - p.rightTrimStart) / fps / p.speed;
+            const totalDur = start3 + dur3;
+
+            // Simple loop via timeout for now? Or check mixer time in animate?
+            // Let's use a timeout for the loop re-trigger
+            sequencer.loopTimer = setTimeout(playSequencerLoop, totalDur * 1000);
+        }
+
+        function configureAction(action, startFrame, endFrame, speed) {
+            action.reset();
+            action.timeScale = speed;
+            // Crop? Three.js doesn't have crop on Action.
+            // We simulate crop by setting time and duration?
+            // Actually, we should subclip BEFORE playing if we want true trim.
+            // But simple "time" set works if we stop it.
+            // For Sequencer, let's use AnimationUtils.subclip on the fly!
+
+            // Actually, manipulating the ORIGINAL clip is risky if we call this loop 60fps.
+            // But doing it once per "Restart" is fine.
+            // Let's create specific subclips for this iteration.
+
+            // Better: Just set .time = start, and .setDuration?
+            // action.time = startFrame/30;
+            // This is complex for chained actions.
+
+            // EASIEST: Generate NEW temporary clips based on trims.
+            const clip = action.getClip();
+            // Note: subclip creates a new clip
+            const newClip = THREE.AnimationUtils.subclip(clip, clip.name + "_sub", startFrame, endFrame, 30);
+
+            // We must hook this new clip to the mixer
+            const newAction = mixer.clipAction(newClip);
+            newAction.timeScale = speed;
+            newAction.loop = THREE.LoopOnce;
+            newAction.clampWhenFinished = true; // Avoid flickering to bind pose
+
+            // Replace the 'action' ref with this new one in the caller scope? 
+            // The caller used 'sequencer.clips'. We shouldn't mutate that.
+            // The caller does 'mixer.clipAction(sequencer.clips.start)'.
+
+            // Fix: The playSequencerLoop should generate subclips.
+            return newAction;
+        }
+
+
+        function handleDrop(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            console.log('Drop event received');
+            console.log('DataTransfer types:', e.dataTransfer?.types);
+
+            // Try File first (from Windows Explorer)
+            const files = e.dataTransfer?.files;
+            if (files && files.length > 0) {
+                const file = files[0];
+                console.log('Dropped file object:', file.name);
+                dropZone.classList.add('hidden');
+                loadFile(file);
+                return;
+            }
+
+            // Try text/plain (from VS Code or other sources)
+            const text = e.dataTransfer?.getData('text/plain') || e.dataTransfer?.getData('text');
+            if (text) {
+                console.log('Dropped text:', text);
+                // Check if it looks like a file path
+                if (text.endsWith('.glb') || text.endsWith('.gltf')) {
+                    dropZone.classList.add('hidden');
+                    loadFromPath(text);
+                    return;
+                }
+            }
+
+            // Try text/uri-list
+            const uri = e.dataTransfer?.getData('text/uri-list');
+            if (uri) {
+                console.log('Dropped URI:', uri);
+                dropZone.classList.add('hidden');
+                loadFromPath(uri);
+                return;
+            }
+
+            console.log('No valid file or path found in drop');
+            alert('Could not read the dropped file. Try using "Select File" button instead.');
+        }
+
+        function loadFile(file) {
+            dropZone.classList.add('hidden');
+            loading.style.display = 'block';
+            console.log('Loading file:', file.name);
+
+            const reader = new FileReader();
+            reader.onerror = () => {
+                loading.style.display = 'none';
+                console.error('FileReader error:', reader.error);
+                alert('Error reading file!');
+            };
+            reader.onload = function (event) {
+                console.log('File read complete, size:', event.target.result.byteLength);
+                loadGLB(event.target.result);
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        function loadFromPath(path) {
+            // Convert Windows path to relative URL if needed
+            let url = path;
+            if (path.includes(':\\')) {
+                // It's a Windows absolute path - try to make it relative
+                const basePath = 'c:\\Users\\baral\\Downloads\\COV\\';
+                if (path.toLowerCase().startsWith(basePath.toLowerCase())) {
+                    url = '../' + path.substring(basePath.length).replace(/\\\\/g, '/');
+                } else {
+                    alert('Cannot load files from outside the server directory. Use "Select File" instead.');
+                    return;
+                }
+            }
+
+            console.log('Fetching from URL:', url);
+            loading.style.display = 'block';
+
+            fetch(url)
+                .then(response => {
+                    if (!response.ok) throw new Error('Fetch failed: ' + response.status);
+                    return response.arrayBuffer();
+                })
+                .then(buffer => {
+                    console.log('Fetch complete, size:', buffer.byteLength);
+                    loadGLB(buffer);
+                })
+                .catch(err => {
+                    loading.style.display = 'none';
+                    console.error('Fetch error:', err);
+                    alert('Could not fetch file. Use "Select File" button instead.');
+                });
+        }
+
+        function loadGLB(arrayBuffer) {
+            loading.style.display = 'block';
+
+            // Cleanup previous
+            if (currentModel) scene.remove(currentModel);
+            if (mixer) mixer.stopAllAction();
+
+            const loader = new GLTFLoader();
+            loader.parse(arrayBuffer, '', (gltf) => {
+                loading.style.display = 'none';
+                currentModel = gltf.scene;
+                currentAnimations = gltf.animations;
+
+                scene.add(currentModel);
+
+                // Setup Shadow
+                currentModel.traverse((node) => {
+                    if (node.isMesh) {
+                        node.castShadow = true;
+                        node.receiveShadow = true;
+                    }
+                });
+
+                // Auto-center camera
+                const box = new THREE.Box3().setFromObject(currentModel);
+                const center = box.getCenter(new THREE.Vector3());
+                const size = box.getSize(new THREE.Vector3());
+                // camera.position.set(center.x, center.y + size.y/2, center.z + size.z * 2);
+
+                mixer = new THREE.AnimationMixer(currentModel);
+
+                setupAnimationGUI();
+            }, (err) => {
+                console.error(err);
+                loading.innerText = 'Error loading model';
+            });
+        }
+
+        function setupAnimationGUI() {
+            // Remove old animation folders if any (by recreating GUI or removing folder)
+            // Ideally we'd keep the GUI structure clean. Let's just reset parts.
+            // Simplified: Add animation selector.
+
+            const animFolder = gui.folders.find(f => f._title === 'Animations') || gui.addFolder('Animations');
+            // Clear existing controls in folder
+            while (animFolder.controllers.length > 0) animFolder.controllers[0].destroy();
+
+            if (currentAnimations.length === 0) return;
+
+            const animNames = currentAnimations.map(a => a.name);
+            settings.currentAnim = animNames[0];
+
+            animFolder.add(settings, 'currentAnim', animNames).name('Active Clip').onChange(playAnimation);
+
+            playAnimation(settings.currentAnim);
+        }
+
+        function playAnimation(name) {
+            if (!mixer) return;
+            mixer.stopAllAction();
+
+            const clip = THREE.AnimationClip.findByName(currentAnimations, name);
+            activeAction = mixer.clipAction(clip);
+
+            // Apply current settings
+            activeAction.timeScale = settings.playbackSpeed;
+            activeAction.play();
+
+            updateTrimControls(clip);
+        }
+
+        function updateTrimControls(clip) {
+            // Total Frames (approx at 30fps)
+            const totalFrames = Math.floor(clip.duration * 30);
+
+            settings.trimStart = 0;
+            settings.trimEnd = totalFrames;
+
+            // Find or creat Trim folder
+            let folder = gui.folders.find(f => f._title === 'Trimming (Frames)');
+            while (folder.controllers.length > 0) folder.controllers[0].destroy();
+
+            folder.add(settings, 'trimStart', 0, totalFrames, 1).name('Start Frame').onChange(updateTrim);
+            folder.add(settings, 'trimEnd', 0, totalFrames, 1).name('End Frame').onChange(updateTrim);
+        }
+
+        function updateTrim() {
+            // This is just VISUAL loop constraint for play mode
+            // Actual cropping happens on export
+            if (!activeAction) return;
+
+            const startT = settings.trimStart / 30; // Assuming 30fps
+            const endT = settings.trimEnd / 30;
+
+            // We can check loop in update loop
+        }
+
+        function updateSpeed() {
+            if (activeAction) activeAction.timeScale = settings.playbackSpeed;
+        }
+
+        function togglePlay() {
+            settings.play ? mixer.timeScale = 1 : mixer.timeScale = 0;
+        }
+
+        // --- EXPORT LOGIC ---
+        function exportGLB() {
+            if (!currentModel) return;
+
+            // 1. PROCESS ANIMATIONS
+            // We need to create a NEW set of animations based on user settings (Speed, Trim)
+            // NOTE: Currently only processes the ACTIVE animation for simplicity, 
+            // or we could replace the active one in the list.
+
+            const modifiedAnimations = [];
+
+            // Example: Modify the active clip
+            if (activeAction) {
+                const originalClip = activeAction.getClip();
+
+                // A. Apply Speed (Scale Times)
+                // If speed is 2.0x, duration should be HALF. time = time / speed.
+                const speed = settings.playbackSpeed;
+
+                // B. Apply Trim
+                const startFrame = settings.trimStart;
+                const endFrame = settings.trimEnd;
+                const fps = 30;
+                const startTime = startFrame / fps;
+                const endTime = endFrame / fps;
+
+                // Create Subclip (Trim)
+                // subclip( sourceClip, name, startFrame, endFrame, fps ) - arguments are frame indices if string, or time?
+                // Three.js AnimationUtils.subclip expects frames as indices? Documentation says: 
+                // .subclip ( clip : AnimationClip, name : String, startFrame : Number, endFrame : Number, fps : Number ) 
+
+                let processedClip = THREE.AnimationUtils.subclip(originalClip, originalClip.name, startFrame, endFrame, fps);
+
+                // Apply Speed to keys
+                // We manually scale tracks because there's no helper for "bake speed"
+                if (speed !== 1.0) {
+                    processedClip.tracks.forEach(track => {
+                        for (let i = 0; i < track.times.length; i++) {
+                            track.times[i] = track.times[i] / speed;
+                        }
+                    });
+                    processedClip.duration = processedClip.duration / speed;
+                }
+
+                modifiedAnimations.push(processedClip);
+            }
+
+            // 2. EXPORT
+            const exporter = new GLTFExporter();
+            const options = {
+                binary: true,
+                animations: modifiedAnimations, // Use our modified list
+                truncateDrawRange: true
+            };
+
+            exporter.parse(
+                currentModel,
+                function (result) {
+                    saveArrayBuffer(result, settings.exportName + '.glb');
+                },
+                function (error) {
+                    console.error('An error happened during export:', error);
+                    alert("Export failed check console");
+                },
+                options
+            );
+        }
+
+        function saveArrayBuffer(buffer, filename) {
+            const blob = new Blob([buffer], { type: 'application/octet-stream' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            link.click();
+            URL.revokeObjectURL(link.href);
+        }
+
+        // --- ANIMATION LOOP ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+
+            if (mixer) {
+                if (sequencer.active) {
+                    mixer.update(dt);
+                } else if (settings.play) {
+                    // Logic for Standard Editor
+                    if (activeAction) {
+                        const time = activeAction.time;
+                        // const duration = activeAction.getClip().duration;
+                        const startT = settings.trimStart / 30; // Assuming 30fps
+                        const endT = settings.trimEnd / 30;
+
+                        // Visual Loop Constraint
+                        if (time < startT || time > endT) {
+                            activeAction.time = startT;
+                        }
+                    }
+                    mixer.update(dt);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+
+</html>
