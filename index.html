@@ -127,6 +127,12 @@
             transform: scale(0.95);
         }
 
+        .swatch.active {
+            border-color: #4a90e2;
+            box-shadow: 0 0 12px rgba(74, 144, 226, 0.7), 0 2px 5px rgba(0, 0, 0, 0.5);
+            transform: scale(1.15) translateY(-2px);
+        }
+
         .no-colors-msg {
             font-size: 13px;
             color: #666;
@@ -134,6 +140,47 @@
             width: 100%;
             text-align: center;
             padding: 10px 0;
+        }
+
+        /* Segmentation Toggle */
+        .toggle-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            border: 1px solid #555;
+            background: rgba(0, 0, 0, 0.3);
+            color: #aaa;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            user-select: none;
+        }
+
+        .toggle-btn:hover {
+            border-color: #888;
+        }
+
+        .toggle-btn.on {
+            background: rgba(255, 140, 0, 0.15);
+            border-color: #FF8C00;
+            color: #FF8C00;
+            box-shadow: 0 0 10px rgba(255, 140, 0, 0.2);
+        }
+
+        .toggle-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #555;
+            transition: background 0.3s ease;
+        }
+
+        .toggle-btn.on .toggle-indicator {
+            background: #FF8C00;
+            box-shadow: 0 0 6px #FF8C00;
         }
 
         /* Toast Notification */
@@ -199,6 +246,11 @@
             </div>
         </div>
 
+        <div class="toggle-btn" id="seg-toggle">
+            <span class="toggle-indicator"></span>
+            <span>Segmentation</span>
+        </div>
+
         <div class="instruction">
             Click on any extracted color swatch to instantly copy its Hex code to your clipboard.
             <br><br>
@@ -213,6 +265,7 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
         // --- Core Setup ---
         const container = document.getElementById('canvas-container');
@@ -229,7 +282,7 @@
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        renderer.toneMappingExposure = 1.0;
+        renderer.toneMappingExposure = 1.5;
         renderer.outputColorSpace = THREE.SRGBColorSpace;
         container.appendChild(renderer.domElement);
 
@@ -237,21 +290,59 @@
         controls.enableDamping = true;
         controls.dampingFactor = 0.05;
 
+        // --- PBR Environment Map (critical for realistic materials) ---
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        pmremGenerator.compileEquirectangularShader();
+        const envMap = pmremGenerator.fromScene(new RoomEnvironment()).texture;
+        scene.environment = envMap;
+        pmremGenerator.dispose();
+
         // --- Lighting ---
-        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
+        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
         hemiLight.position.set(0, 20, 0);
         scene.add(hemiLight);
 
-        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
         dirLight.position.set(5, 10, 7);
         scene.add(dirLight);
 
-        const backLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        const backLight = new THREE.DirectionalLight(0xffffff, 0.6);
         backLight.position.set(-5, 5, -7);
         scene.add(backLight);
 
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
+        fillLight.position.set(0, -5, 5);
+        scene.add(fillLight);
+
         let modelGroup = new THREE.Group();
+        let allMeshes = [];
+        const originalMaterials = new Map();
+        const meshTextureCache = new Map(); // mesh -> { originalImage, originalMap }
+        let highlightTextures = []; // temp textures to dispose
+        let segmentationEnabled = false;
+        const dimMaterial = new THREE.MeshBasicMaterial({
+            color: 0x222222,
+            transparent: true,
+            opacity: 0.15,
+            depthWrite: false
+        });
         scene.add(modelGroup);
+
+        // --- Segmentation Toggle ---
+        document.getElementById('seg-toggle').addEventListener('click', () => {
+            segmentationEnabled = !segmentationEnabled;
+            document.getElementById('seg-toggle').classList.toggle('on', segmentationEnabled);
+            // Restore materials if toggling off
+            if (!segmentationEnabled) {
+                allMeshes.forEach(mesh => {
+                    const orig = originalMaterials.get(mesh);
+                    if (orig) mesh.material = orig;
+                });
+                highlightTextures.forEach(t => t.dispose());
+                highlightTextures = [];
+                document.querySelectorAll('.swatch.active').forEach(s => s.classList.remove('active'));
+            }
+        });
 
         // --- Toast Notification ---
         let toastTimeout;
@@ -293,22 +384,20 @@
                 const root = gltf.scene;
                 const meshes = [];
 
-                // Re-center model
-                const box = new THREE.Box3().setFromObject(root);
-                const center = box.getCenter(new THREE.Vector3());
-                const size = box.getSize(new THREE.Vector3());
+                // Update all world matrices first so transforms are accurate
+                root.updateWorldMatrix(true, true);
 
-                root.position.x += (root.position.x - center.x);
-                root.position.y += (root.position.y - center.y);
-                root.position.z += (root.position.z - center.z);
-
-                const maxDim = Math.max(size.x, size.y, size.z);
-                camera.position.set(0, size.y * 0.2, maxDim * 2.2);
-                controls.target.set(0, 0, 0);
-
-                // Collect meshes for extraction
+                // Manually compute accurate bounding box (handles SkinnedMesh properly)
+                const box = new THREE.Box3();
                 root.traverse((child) => {
                     if (child.isMesh) {
+                        const geo = child.geometry;
+                        if (!geo.boundingBox) geo.computeBoundingBox();
+                        const meshBox = geo.boundingBox.clone();
+                        meshBox.applyMatrix4(child.matrixWorld);
+                        box.union(meshBox);
+
+                        // Fix texture color space while traversing
                         if (child.material.map) {
                             child.material.map.colorSpace = THREE.SRGBColorSpace;
                         }
@@ -316,7 +405,31 @@
                     }
                 });
 
-                modelGroup.add(root);
+                // Compute center and size from the accurate bounding box
+                const center = box.getCenter(new THREE.Vector3());
+                const size = box.getSize(new THREE.Vector3());
+
+                // Wrap the model to scale and center it
+                const wrapper = new THREE.Group();
+                wrapper.add(root);
+
+                // Offset root inside the wrapper to center its geometry at origin
+                root.position.sub(center);
+
+                // Scale so the max dimension fits comfortably in view (~5 units)
+                const maxDim = Math.max(size.x, size.y, size.z) || 1;
+                const targetSize = 5;
+                wrapper.scale.setScalar(targetSize / maxDim);
+
+                // Add to scene
+                modelGroup.add(wrapper);
+
+                // Frame the camera to see the full model
+                const fov = camera.fov * (Math.PI / 180);
+                const cameraZ = (targetSize / 2) / Math.tan(fov / 2) * 1.4;
+                camera.position.set(0, 0, cameraZ);
+                controls.target.set(0, 0, 0);
+                controls.update();
                 setStatus("Extracting texture colors...", true);
 
                 // Allow UI to update before heavy extraction
@@ -330,6 +443,11 @@
 
         // --- The Extraction Logic ---
         function extractColors(meshes) {
+            // Save original materials for hover restore
+            allMeshes = meshes;
+            originalMaterials.clear();
+            meshes.forEach(m => originalMaterials.set(m, m.material));
+
             const samplerCanvas = document.createElement('canvas');
             const sSize = 256; // Sampling resolution
             samplerCanvas.width = sSize;
@@ -344,6 +462,12 @@
 
                 // If it has a texture image, sample it
                 if (texMap && texMap.image) {
+                    // Cache original texture image for per-pixel highlighting
+                    meshTextureCache.set(mesh, {
+                        originalImage: texMap.image,
+                        originalMap: texMap
+                    });
+
                     try {
                         samplerCtx.clearRect(0, 0, sSize, sSize);
                         samplerCtx.drawImage(texMap.image, 0, 0, sSize, sSize);
@@ -364,13 +488,14 @@
                             const key = `${qr},${qg},${qb}`;
 
                             if (!colorBuckets[key]) {
-                                colorBuckets[key] = { r: 0, g: 0, b: 0, count: 0 };
+                                colorBuckets[key] = { r: 0, g: 0, b: 0, count: 0, meshes: new Set() };
                             }
                             const bucket = colorBuckets[key];
                             bucket.r += r;
                             bucket.g += g;
                             bucket.b += b;
                             bucket.count++;
+                            bucket.meshes.add(mesh);
                         }
                     } catch (err) {
                         console.warn("Could not read texture for mesh:", mesh.name, err);
@@ -384,19 +509,25 @@
                     const key = `${r},${g},${b}`;
                     if (!colorBuckets[key]) {
                         // Give solid colors a high simulated pixel count so they show up
-                        colorBuckets[key] = { r: r * 500, g: g * 500, b: b * 500, count: 500 };
+                        colorBuckets[key] = { r: r * 500, g: g * 500, b: b * 500, count: 500, meshes: new Set() };
                     }
+                    colorBuckets[key].meshes.add(mesh);
                 }
             }
 
             // Average the buckets and sort by frequency
-            const sorted = Object.values(colorBuckets)
-                .map(b => ({
-                    r: Math.round(b.r / b.count),
-                    g: Math.round(b.g / b.count),
-                    b: Math.round(b.b / b.count),
-                    count: b.count
-                }))
+            const sorted = Object.entries(colorBuckets)
+                .map(([key, b]) => {
+                    const [qr, qg, qb] = key.split(',').map(Number);
+                    return {
+                        r: Math.round(b.r / b.count),
+                        g: Math.round(b.g / b.count),
+                        b: Math.round(b.b / b.count),
+                        qr, qg, qb, // quantized bucket key for pixel matching
+                        count: b.count,
+                        meshes: b.meshes
+                    };
+                })
                 // Filter out absolute blacks/whites as they are often background/padding
                 .filter(c => {
                     const brightness = (c.r + c.g + c.b) / 3;
@@ -430,20 +561,104 @@
 
             colors.forEach(c => {
                 const hex = rgbToHex(c.r, c.g, c.b);
+                const matchingMeshes = c.meshes || new Set();
+                const tqr = c.qr, tqg = c.qg, tqb = c.qb; // quantized bucket key
                 const wrapper = document.createElement('div');
                 wrapper.className = 'swatch-container';
 
                 const swatch = document.createElement('div');
                 swatch.className = 'swatch';
                 swatch.style.backgroundColor = hex;
-                swatch.title = `Click to copy ${hex}`;
+                swatch.title = `Hover to highlight on model · Click to copy ${hex}`;
+
+                // --- Per-Pixel Texture Segmentation on Hover ---
+                swatch.addEventListener('mouseenter', () => {
+                    if (!segmentationEnabled) return;
+                    swatch.classList.add('active');
+
+                    // Dispose any previous highlight textures
+                    highlightTextures.forEach(t => t.dispose());
+                    highlightTextures = [];
+
+                    allMeshes.forEach(mesh => {
+                        const cache = meshTextureCache.get(mesh);
+                        if (cache) {
+                            // Create a per-pixel highlighted version of this texture
+                            const hRes = 512; // highlight resolution (balance of quality & speed)
+                            const hCanvas = document.createElement('canvas');
+                            hCanvas.width = hRes;
+                            hCanvas.height = hRes;
+                            const hCtx = hCanvas.getContext('2d');
+                            hCtx.drawImage(cache.originalImage, 0, 0, hRes, hRes);
+                            const imgData = hCtx.getImageData(0, 0, hRes, hRes);
+                            const px = imgData.data;
+
+                            let hasMatch = false;
+                            // Color distance threshold (squared) for matching
+                            const threshold = 75;
+                            const thresholdSq = threshold * threshold;
+
+                            for (let i = 0; i < px.length; i += 4) {
+                                if (px[i + 3] < 128) continue; // skip transparent
+
+                                // Direct distance to the hovered swatch color
+                                const dr = px[i] - c.r;
+                                const dg = px[i + 1] - c.g;
+                                const db = px[i + 2] - c.b;
+                                const distSq = dr * dr + dg * dg + db * db;
+
+                                if (distSq <= thresholdSq) {
+                                    // MATCH — paint solid orange highlight
+                                    hasMatch = true;
+                                    px[i] = 255; // R
+                                    px[i + 1] = 140; // G
+                                    px[i + 2] = 0;   // B (= #FF8C00 dark orange)
+                                } else {
+                                    // NO MATCH — convert to dim grayscale
+                                    const gray = Math.round((px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114) * 0.3);
+                                    px[i] = gray;
+                                    px[i + 1] = gray;
+                                    px[i + 2] = gray;
+                                }
+                            }
+                            hCtx.putImageData(imgData, 0, 0);
+
+                            if (hasMatch) {
+                                const hlTex = new THREE.CanvasTexture(hCanvas);
+                                hlTex.colorSpace = THREE.SRGBColorSpace;
+                                hlTex.flipY = cache.originalMap.flipY;
+                                highlightTextures.push(hlTex);
+
+                                // Clone material so we don't modify original
+                                const hlMat = originalMaterials.get(mesh).clone();
+                                hlMat.map = hlTex;
+                                hlMat.needsUpdate = true;
+                                mesh.material = hlMat;
+                            } else {
+                                mesh.material = dimMaterial;
+                            }
+                        } else if (!matchingMeshes.has(mesh)) {
+                            mesh.material = dimMaterial;
+                        }
+                    });
+                });
+
+                swatch.addEventListener('mouseleave', () => {
+                    swatch.classList.remove('active');
+                    // Restore all original materials
+                    allMeshes.forEach(mesh => {
+                        mesh.material = originalMaterials.get(mesh);
+                    });
+                    // Dispose highlight textures
+                    highlightTextures.forEach(t => t.dispose());
+                    highlightTextures = [];
+                });
 
                 swatch.addEventListener('click', () => {
                     navigator.clipboard.writeText(hex).then(() => {
                         showToast(`Copied ${hex} to clipboard`);
                     }).catch(err => {
                         console.error('Could not copy text: ', err);
-                        // Fallback
                         const textArea = document.createElement("textarea");
                         textArea.value = hex;
                         document.body.appendChild(textArea);
